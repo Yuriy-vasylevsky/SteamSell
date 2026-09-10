@@ -12,7 +12,15 @@ from app.models import Base
 def test_initial_migration_roundtrip_matches_models():
     root = Path(__file__).parents[1] / "alembic/versions"
     migrations = []
-    for name in ("0001_initial.py", "0002_payment_animation.py", "0003_manual_payment.py", "0004_personal.py", "0005_receipt_payments.py"):
+    for name in (
+        "0001_initial.py",
+        "0002_payment_animation.py",
+        "0003_manual_payment.py",
+        "0004_personal.py",
+        "0005_receipt_payments.py",
+        "0006_home_products.py",
+        "0007_broadcast_subscription.py",
+    ):
         spec = importlib.util.spec_from_file_location(name, root / name)
         migration = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(migration)

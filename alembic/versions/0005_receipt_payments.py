@@ -1,6 +1,7 @@
 """Add DeepSeek receipt payments and managed cards."""
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0005"

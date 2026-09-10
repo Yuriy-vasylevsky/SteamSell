@@ -35,10 +35,10 @@ async def test_personal_requires_amount_time_and_accepts_positive_hold(shop):
     order = await shop.checkout(1, 1)
     shop.mono.create.assert_not_awaited()
     assert (await shop.checkout(1, 1)).id == order.id
-    entry = dict(id="transfer1", amount=order.price_snapshot, currencyCode=980,
-                 hold=True, time=int(now().timestamp()))
-    for changes in ({"amount": -49900}, {"amount": 1},
-                    {"currencyCode": 840}, {"time": 1}):
+    entry = dict(
+        id="transfer1", amount=order.price_snapshot, currencyCode=980, hold=True, time=int(now().timestamp())
+    )
+    for changes in ({"amount": -49900}, {"amount": 1}, {"currencyCode": 840}, {"time": 1}):
         await apply_statement(shop, "account", [entry | changes])
         async with shop.sessions() as session:
             assert (await session.get(Order, order.id)).status == "waiting_payment"
@@ -61,8 +61,20 @@ async def test_same_amount_assigned_only_to_clicked_order(shop):
     shop.cfg.manual_card = "4441110000000000"
     first = await shop.checkout(1, 1)
     second = await shop.checkout(2, 1)
-    await apply_statement(shop, "account", [dict(id="ambiguous", amount=first.price_snapshot,
-        currencyCode=980, hold=False, time=int(now().timestamp()))], second.id)
+    await apply_statement(
+        shop,
+        "account",
+        [
+            dict(
+                id="ambiguous",
+                amount=first.price_snapshot,
+                currencyCode=980,
+                hold=False,
+                time=int(now().timestamp()),
+            )
+        ],
+        second.id,
+    )
     async with shop.sessions() as session:
         assert (await session.get(Order, first.id)).status == "waiting_payment"
         assert (await session.get(Order, second.id)).status == "paid"
@@ -72,8 +84,9 @@ async def test_same_amount_assigned_only_to_clicked_order(shop):
 async def test_used_transfer_cannot_pay_another_order(shop):
     shop.cfg.manual_card = "4441110000000000"
     first = await shop.checkout(1, 1)
-    entry = dict(id="used", amount=first.price_snapshot, currencyCode=980,
-                 hold=False, time=int(now().timestamp()))
+    entry = dict(
+        id="used", amount=first.price_snapshot, currencyCode=980, hold=False, time=int(now().timestamp())
+    )
     await apply_statement(shop, "account", [entry])
     second = await shop.checkout(2, 1)
     async with shop.sessions() as session, session.begin():

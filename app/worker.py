@@ -2,64 +2,18 @@ import asyncio
 import logging
 from datetime import timedelta
 from html import escape
+from zoneinfo import ZoneInfo
 
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import MessageEntity
 from sqlalchemy import select
 
 from app.i18n import money, tr
 from app.models import Broadcast, Order, Product, User, now
-from app.services import aware, setting
-from app.ui import back, keyboard, payment_rows, payment_wait_text, purchase_rows, purchase_text
+from app.services import aware, setting, shared_gmail_credentials
+from app.ui import back, keyboard, purchase_rows, purchase_text
 
 log = logging.getLogger(__name__)
-
-
-async def animate_waiting_payments(shop, bot):
-    cutoff = now() - timedelta(seconds=4)
-    async with shop.sessions() as session:
-        orders = (
-            await session.scalars(
-                select(Order)
-                .where(
-                    Order.status == "waiting_payment",
-                    Order.payment_message_id.is_not(None),
-                    (Order.payment_animation_at.is_(None) | (Order.payment_animation_at <= cutoff)),
-                )
-                .order_by(Order.payment_animation_at)
-                .limit(20)
-            )
-        ).all()
-        card = getattr(shop.cfg, "manual_card", "")
-        for order in orders:
-            user = await session.get(User, order.user_id)
-            lang = user.language or "ua"
-            order.payment_animation_step = (order.payment_animation_step + 1) % 5
-            order.payment_animation_at = now()
-            await session.commit()
-            try:
-                display_card = card
-                if order.payment_method == "receipt" and order.payment_cards_encrypted:
-                    display_card = "\n".join(
-                        f"{item['label']}: {item['number']}"
-                        for item in shop.vault.unpack(order.payment_cards_encrypted)["cards"]
-                    )
-                await bot.edit_message_text(
-                    payment_wait_text(order, lang, order.payment_animation_step, display_card),
-                    chat_id=order.user_id,
-                    message_id=order.payment_message_id,
-                    parse_mode="HTML",
-                    reply_markup=keyboard(payment_rows(order, lang)),
-                )
-            except TelegramBadRequest:
-                # The user may have deleted the payment message; stop editing it.
-                order.payment_message_id = None
-                await session.commit()
-            except TelegramRetryAfter as error:
-                await asyncio.sleep(error.retry_after)
-                return
-            except Exception:
-                log.warning("payment_animation_failed order=%s", order.id)
 
 
 async def deliver_one(shop, bot):
@@ -84,8 +38,9 @@ async def deliver_one(shop, bot):
         product = await session.get(Product, order.product_id)
         lang = user.language or "ua"
         support = await setting(session, "support_username", shop.cfg.support_username)
+        gmail_connected = bool(await shared_gmail_credentials(session, shop))
         text = purchase_text(order, product, lang, shop.vault)
-        markup = keyboard(purchase_rows(order, lang, support, bool(product.gmail_credentials_encrypted)))
+        markup = keyboard(purchase_rows(order, lang, support, gmail_connected))
     try:
         message = await bot.send_message(
             user.id, text, parse_mode="HTML", reply_markup=markup, protect_content=True
@@ -148,11 +103,16 @@ async def notify_admin(shop, bot):
                 else "⚠️ Видача потребує перевірки; покупка доступна у «Мої покупки»."
             )
             try:
+                paid_at = aware(order.paid_at).astimezone(ZoneInfo("Europe/Kyiv"))
                 await bot.send_message(
                     shop.cfg.admin_id,
-                    f"💰 Нова покупка\n{escape(order.product_name_snapshot)}\n{money(order.price_snapshot)}\n"
-                    f"@{escape(user.username or '—')} / {user.id}\n✅ Оплату підтверджено\n{status}\n"
-                    f"#{order.id}\n{order.paid_at} UTC",
+                    "💰 <b>Нова покупка</b>\n\n"
+                    f"🎮 {escape(order.product_name_snapshot)}\n"
+                    f"💵 {money(order.price_snapshot)}\n"
+                    f"👤 @{escape(user.username or '—')}\n"
+                    f"🆔 ID: <code>{user.id}</code>\n\n"
+                    f"{status}\n"
+                    f"🕒 {paid_at:%d.%m.%Y · %H:%M}",
                     parse_mode="HTML",
                 )
                 order.admin_notified = True
@@ -171,7 +131,12 @@ async def broadcast_batch(shop, bot):
         users = (
             await session.scalars(
                 select(User)
-                .where(User.id > job.last_user_id, User.blocked.is_(False), User.created_at <= job.created_at)
+                .where(
+                    User.id > job.last_user_id,
+                    User.blocked.is_(False),
+                    User.broadcast_subscribed.is_(True),
+                    User.created_at <= job.created_at,
+                )
                 .order_by(User.id)
                 .limit(20)
             )
@@ -213,7 +178,6 @@ async def worker(shop, bot):
     iteration = 0
     while True:
         try:
-            await animate_waiting_payments(shop, bot)
             for _ in range(20):
                 if not await deliver_one(shop, bot):
                     break

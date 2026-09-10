@@ -1,0 +1,25 @@
+{$DOMAIN:localhost} {
+	encode zstd gzip
+
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle /health* {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+}
+
+77.42.71.244.sslip.io {
+	encode zstd gzip
+	reverse_proxy {
+		dynamic a steamsell-app-1 8000 {
+			refresh 5s
+			resolvers 127.0.0.11
+		}
+	}
+}

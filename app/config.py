@@ -32,6 +32,7 @@ class Config(DatabaseConfig):
                 if not item.strip().isdigit() or int(item.strip()) <= 0:
                     raise ValueError("ADMIN_IDS must contain positive Telegram IDs separated by commas")
         return value
+
     encryption_key: SecretStr
     redis_url: str = "redis://localhost:6379/0"
     public_base_url: str = ""

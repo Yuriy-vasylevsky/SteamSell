@@ -1,4 +1,5 @@
 """Distinguish personal transfers from acquiring invoices."""
+
 import sqlalchemy as sa
 
 from alembic import op
@@ -10,7 +11,9 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column("orders", sa.Column("payment_method", sa.String(16), nullable=False, server_default="acquiring"))
+    op.add_column(
+        "orders", sa.Column("payment_method", sa.String(16), nullable=False, server_default="acquiring")
+    )
 
 
 def downgrade():

@@ -8,12 +8,13 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.filters import Command, Filter
 from aiogram.fsm.state import State, StatesGroup
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 
 from app.access import is_admin
 from app.i18n import money
-from app.models import Broadcast, Order, Product, User, now
-from app.services import SUCCESS, audit, set_setting, setting
+from app.models import Broadcast, Order, PaymentCard, PaymentReceipt, Product, User, now
+from app.services import SUCCESS, audit, configured_manual_card, set_setting, setting
 from app.ui import pagination, product_text, render
 
 
@@ -27,6 +28,8 @@ class Form(StatesGroup):
     edit = State()
     setting = State()
     broadcast = State()
+    card_label = State()
+    card_number = State()
 
 
 FIELDS = [
@@ -38,6 +41,7 @@ FIELDS = [
     "steam_password_encrypted",
     "gmail_credentials_encrypted",
     "featured",
+    "on_home",
 ]
 LABELS = {
     "name_ua": "Назва товару",
@@ -47,14 +51,16 @@ LABELS = {
     "steam_login_encrypted": "Steam Login",
     "steam_password_encrypted": "Steam Password",
     "gmail_credentials_encrypted": "Gmail OAuth",
-    "featured": "Показувати на головній?",
+    "featured": "Додати до новинок?",
+    "on_home": "Показувати на головній?",
 }
 OPTIONAL = {"image_file_id", "description_ua", "gmail_credentials_encrypted"}
 MENU = [
     [("➕ Додати товар", "a:add"), ("📦 Товари", "a:products:0")],
-    [("🧾 Замовлення", "a:orders:all:0"), ("👥 Користувачі", "a:users:0")],
+    [("🔑 Отримати код", "a:latest_code"), ("👥 Користувачі", "a:users:0")],
     [("🔥 Головна сторінка", "a:featured:0"), ("📊 Статистика", "a:stats")],
     [("📢 Розсилка", "a:broadcast"), ("⚙️ Налаштування", "a:settings")],
+    [("💳 Режим оплати", "a:payment_mode"), ("💳 Керування картками", "a:cards")],
     [("⬅️ Вийти з адмінки", "home")],
 ]
 BACK = [("⬅️ Адмінка", "a:home")]
@@ -102,7 +108,7 @@ async def prompt(event, state):
     rows = []
     if field in OPTIONAL:
         rows.append([("Пропустити / очистити", "a:skip")])
-    if field == "featured":
+    if field in ("featured", "on_home"):
         rows.append([("✅ Так", "a:feature:1"), ("❌ Ні", "a:feature:0")])
     if field == "gmail_credentials_encrypted":
         rows += [
@@ -161,10 +167,268 @@ def admin_router():
     router.callback_query.filter(AdminOnly())
 
     @router.message(Command("admin", "cancel"))
+    @router.message(F.text == "⚙️ Адмін-панель")
     @router.callback_query(F.data == "a:home")
     async def home(event, state, shop):
         await state.clear()
         await render(event, "Керування магазином", MENU)
+
+    @router.callback_query(F.data == "a:payment_mode")
+    async def payment_mode(callback, session):
+        mode = await setting(session, "payment_mode", "mono")
+        cards = await session.scalar(
+            select(func.count()).select_from(PaymentCard).where(PaymentCard.active.is_(True))
+        )
+        await render(
+            callback,
+            f"Режим оплати для нових замовлень: <b>{'DeepSeek — перевірка скріну' if mode == 'deepseek' else 'Monobank API'}</b>\nАктивних карток для DeepSeek: {cards}/2",
+            [
+                [("✅ Monobank API" if mode == "mono" else "Monobank API", "a:paymode:mono")],
+                [("✅ DeepSeek-скрін" if mode == "deepseek" else "DeepSeek-скрін", "a:paymode:deepseek")],
+                BACK,
+            ],
+        )
+
+    @router.callback_query(F.data == "a:latest_code")
+    async def latest_steam_code(callback, session, shop):
+        products = (
+            await session.scalars(select(Product).where(Product.deleted_at.is_(None)).order_by(Product.id))
+        ).all()
+        gmail_product = next(
+            (product for product in reversed(products) if product.gmail_credentials_encrypted),
+            None,
+        )
+        if not gmail_product:
+            await render(callback, "Немає товарів із підключеною Gmail-поштою.", [BACK])
+            return
+        accounts = []
+        for product in products:
+            accounts.append(
+                (
+                    shop.vault.decrypt(product.steam_login_encrypted),
+                    product.name_ua,
+                )
+            )
+        try:
+            result = await shop.gmail.latest_code_for_accounts(
+                shop.vault.unpack(gmail_product.gmail_credentials_encrypted),
+                accounts,
+                now() - timedelta(hours=1),
+            )
+        except Exception:
+            await render(
+                callback,
+                "Не вдалося прочитати Gmail. Перевірте підключення пошти та спробуйте ще раз.",
+                [BACK],
+            )
+            return
+        if not result:
+            await render(
+                callback,
+                "За останню годину відповідний код Steam Guard не знайдено.",
+                [[("🔄 Перевірити ще раз", "a:latest_code")], BACK],
+            )
+            return
+        code, login, game, received_at = result
+        await render(
+            callback,
+            "🔑 <b>Останній код Steam Guard</b>\n\n"
+            f"🎮 {escape(game)}\n"
+            f"👤 <code>{escape(login)}</code>\n"
+            f"🔐 <code>{escape(code)}</code>\n"
+            f"🕒 {received_at.astimezone(ZoneInfo('Europe/Kyiv')):%d.%m.%Y · %H:%M}",
+            [[("🔄 Оновити", "a:latest_code")], BACK],
+        )
+
+    @router.callback_query(F.data.regexp(r"^a:paymode:(mono|deepseek)$"))
+    async def payment_mode_set(callback, session):
+        mode = callback.data.rsplit(":", 1)[1]
+        if mode == "deepseek" and not await session.scalar(
+            select(PaymentCard.id).where(PaymentCard.active.is_(True)).limit(1)
+        ):
+            await callback.message.answer("Спочатку додайте хоча б одну активну картку.")
+            return
+        await set_setting(session, "payment_mode", mode)
+        audit(session, callback.from_user.id, "payment_mode", mode)
+        await session.commit()
+        await render(callback, "Режим оплати змінено. Він діятиме для нових замовлень.", [BACK])
+
+    @router.callback_query(F.data == "a:cards")
+    async def cards(callback, session, shop):
+        items = (await session.scalars(select(PaymentCard).order_by(PaymentCard.id))).all()
+        active = sum(card.active for card in items)
+        mono_card = await configured_manual_card(session, shop)
+        rows = [[(f"🏦 Monobank •••• {mono_card[-4:] if mono_card else 'не задано'}", "a:mono_card")]]
+        rows += [
+            [(f"{'🟢' if c.active else '⚫'} {c.label} •••• {c.last4}", f"a:card:{c.id}")] for c in items
+        ]
+        if active < 2:
+            rows.append([("➕ Додати картку", "a:card_add")])
+        rows.append(BACK)
+        await render(callback, f"Картка Monobank та картки для DeepSeek. Активних DeepSeek: {active}/2", rows)
+
+    @router.callback_query(F.data == "a:mono_card")
+    async def mono_card_replace(callback, state):
+        await state.set_state(Form.card_number)
+        await state.set_data({"card_action": "mono"})
+        await render(callback, "Введіть новий номер картки Monobank (16–19 цифр).", [BACK])
+
+    @router.callback_query(F.data == "a:card_add")
+    async def card_add(callback, state):
+        await state.set_state(Form.card_label)
+        await state.set_data({"card_action": "add"})
+        await render(callback, "Введіть назву картки, наприклад «mono». Максимум 64 символи.", [BACK])
+
+    @router.message(Form.card_label)
+    async def card_label(message, state):
+        label = (message.text or "").strip()
+        if not label or len(label) > 64:
+            await message.answer("Введіть назву від 1 до 64 символів.")
+            return
+        await state.update_data(card_label=label)
+        await state.set_state(Form.card_number)
+        await message.answer("Введіть номер картки (16–19 цифр). Повідомлення буде видалено.")
+
+    @router.message(Form.card_number)
+    async def card_number(message, state, session, shop):
+        digits = re.sub(r"\D", "", message.text or "")
+        if not 16 <= len(digits) <= 19:
+            await message.answer("Номер має містити 16–19 цифр.")
+            return
+        data = await state.get_data()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        if data.get("card_action") == "mono":
+            await set_setting(session, "manual_card", shop.vault.encrypt(digits))
+            shop.cfg.manual_card = digits
+            shop.personal_account = None
+            shop.personal_cursors = {}
+            shop.personal_next = 0
+            target = "mono"
+        elif data.get("card_action") == "replace":
+            card = await session.get(PaymentCard, data.get("card_id"))
+            if not card:
+                return
+            card.number_encrypted, card.last4 = shop.vault.encrypt(digits), digits[-4:]
+            target = card.id
+        else:
+            active = await session.scalar(
+                select(func.count()).select_from(PaymentCard).where(PaymentCard.active.is_(True))
+            )
+            if active >= 2:
+                await message.answer("Уже є дві активні картки. Вимкніть одну перед додаванням.")
+                return
+            card = PaymentCard(
+                label=data["card_label"], number_encrypted=shop.vault.encrypt(digits), last4=digits[-4:]
+            )
+            session.add(card)
+            await session.flush()
+            target = card.id
+        audit(session, message.from_user.id, "payment_card_saved", target)
+        await session.commit()
+        await state.clear()
+        await render(message, "Картку збережено.", [[("💳 До карток", "a:cards")], BACK])
+
+    @router.callback_query(F.data.regexp(r"^a:card:\d+$"))
+    async def card_detail(callback, session):
+        card = await session.get(PaymentCard, int(callback.data.rsplit(":", 1)[1]))
+        if not card:
+            return
+        await render(
+            callback,
+            f"{escape(card.label)}\n•••• {card.last4}\nСтатус: {'активна' if card.active else 'вимкнена'}",
+            [
+                [("🔄 Замінити номер", f"a:card_replace:{card.id}")],
+                [("⏸ Вимкнути" if card.active else "▶️ Увімкнути", f"a:card_toggle:{card.id}")],
+                [("🗑 Видалити", f"a:card_delete:{card.id}")],
+                [("⬅️ Картки", "a:cards")],
+                BACK,
+            ],
+        )
+
+    @router.callback_query(F.data.regexp(r"^a:card_replace:\d+$"))
+    async def card_replace(callback, state, session):
+        card_id = int(callback.data.rsplit(":", 1)[1])
+        if not await session.get(PaymentCard, card_id):
+            return
+        await state.set_state(Form.card_number)
+        await state.set_data({"card_action": "replace", "card_id": card_id})
+        await render(callback, "Введіть новий номер картки (16–19 цифр).", [BACK])
+
+    @router.callback_query(F.data.regexp(r"^a:card_toggle:\d+$"))
+    async def card_toggle(callback, session):
+        card = await session.get(PaymentCard, int(callback.data.rsplit(":", 1)[1]))
+        if not card:
+            return
+        if not card.active:
+            active = await session.scalar(
+                select(func.count()).select_from(PaymentCard).where(PaymentCard.active.is_(True))
+            )
+            if active >= 2:
+                await callback.message.answer("Одночасно можуть бути активними максимум дві картки.")
+                return
+        card.active = not card.active
+        audit(session, callback.from_user.id, "payment_card_toggle", card.id)
+        await session.commit()
+        await render(callback, "Статус картки змінено.", [[("💳 До карток", "a:cards")], BACK])
+
+    @router.callback_query(F.data.regexp(r"^a:card_delete:\d+$"))
+    async def card_delete(callback, session):
+        card_id = int(callback.data.rsplit(":", 1)[1])
+        await session.execute(sa_delete(PaymentCard).where(PaymentCard.id == card_id))
+        audit(session, callback.from_user.id, "payment_card_delete", card_id)
+        await session.commit()
+        await render(
+            callback,
+            "Картку видалено. Старі замовлення зберегли свої реквізити.",
+            [[("💳 До карток", "a:cards")], BACK],
+        )
+
+    @router.callback_query(F.data.regexp(r"^a:receipt:(approve|reject):\d+$"))
+    async def receipt_review(callback, session):
+        _, _, decision, receipt_id = callback.data.split(":")
+        receipt = await session.get(PaymentReceipt, int(receipt_id), with_for_update=True)
+        if not receipt:
+            return
+        if receipt.status != "manual_review":
+            status = "✅ Підтверджено" if receipt.status == "approved" else "❌ Відхилено"
+            caption = callback.message.caption or f"Заявка #{receipt.id}"
+            if status not in caption:
+                caption = caption[: 1024 - len(status) - 2] + "\n\n" + status
+            try:
+                await callback.message.edit_caption(caption=caption, reply_markup=None)
+            except Exception:
+                pass
+            return
+        order = await session.get(Order, receipt.order_id, with_for_update=True)
+        receipt.status = "approved" if decision == "approve" else "rejected"
+        receipt.reviewed_by, receipt.reviewed_at = callback.from_user.id, now()
+        if decision == "approve" and order.status == "waiting_payment":
+            order.status, order.paid_at = "paid", now()
+        elif decision == "reject" and order.status == "waiting_payment":
+            order.status = "cancelled"
+        audit(session, callback.from_user.id, "receipt_" + decision, receipt.id)
+        await session.commit()
+        reason = (receipt.reason or "Причину не вдалося визначити").strip()
+        if decision == "reject":
+            await callback.bot.send_message(
+                receipt.user_id,
+                f"❌ Скрин оплати відхилено.\n\nПричина: {reason}\n\n"
+                "Заявку закрито. Тепер ви можете створити нову покупку.",
+            )
+        status = (
+            "✅ Підтверджено адміністратором — товар буде видано автоматично"
+            if decision == "approve"
+            else "❌ Відхилено адміністратором — заявку закрито"
+        )
+        caption = callback.message.caption or f"Заявка #{receipt.id}"
+        caption = caption[: 1024 - len(status) - 2] + "\n\n" + status
+        try:
+            await callback.message.edit_caption(caption=caption, reply_markup=None)
+        except Exception:
+            await callback.message.answer(status)
 
     @router.callback_query(F.data == "a:add")
     async def add(callback, state):
@@ -196,7 +460,7 @@ def admin_router():
     async def input_product(message, state, shop):
         data = await state.get_data()
         field = data["field"]
-        if field in ("featured", "gmail_credentials_encrypted"):
+        if field in ("featured", "on_home", "gmail_credentials_encrypted"):
             await prompt(message, state)
             return
         try:
@@ -220,7 +484,7 @@ def admin_router():
 
     @router.callback_query(F.data.startswith("a:feature:"))
     async def feature(callback, state, shop):
-        if (await state.get_data()).get("field") == "featured":
+        if (await state.get_data()).get("field") in ("featured", "on_home"):
             await accept(callback, state, shop, callback.data.endswith(":1"))
 
     @router.callback_query(F.data == "a:oauth")
@@ -274,7 +538,7 @@ def admin_router():
         _, kind, page = callback.data.split(":")
         query = select(Product).where(Product.deleted_at.is_(None))
         if kind == "featured":
-            query = query.where(Product.featured.is_(True))
+            query = query.where(Product.on_home.is_(True))
         total = await session.scalar(select(func.count()).select_from(query.subquery()))
         page = min(int(page), max(0, (total - 1) // 7))
         items = (
@@ -296,10 +560,17 @@ def admin_router():
         p = await session.get(Product, int(callback.data.split(":")[2]))
         if not p:
             return
-        rows = [[(label, f"a:edit:{p.id}:{field}")] for field, label in LABELS.items() if field != "featured"]
+        rows = [
+            [(label, f"a:edit:{p.id}:{field}")]
+            for field, label in LABELS.items()
+            if field not in ("featured", "on_home")
+        ]
         rows += [
             [
-                ("🔥 Головна: " + str(p.featured), f"a:toggle:{p.id}:featured"),
+                ("🆕 Новинка: " + str(p.featured), f"a:toggle:{p.id}:featured"),
+                ("🔥 Головна: " + str(p.on_home), f"a:toggle:{p.id}:on_home"),
+            ],
+            [
                 ("👁 Видимість: " + str(p.visible), f"a:toggle:{p.id}:visible"),
             ],
             [("⬆️ Вище", f"a:move:{p.id}:-1"), ("⬇️ Нижче", f"a:move:{p.id}:1")],
@@ -334,7 +605,7 @@ def admin_router():
     @router.callback_query(F.data.startswith("a:toggle:"))
     async def toggle(callback, session):
         _, _, pid, field = callback.data.split(":")
-        if field not in ("featured", "visible"):
+        if field not in ("featured", "on_home", "visible"):
             return
         p = await session.get(Product, int(pid))
         if not p or p.deleted_at:
@@ -350,7 +621,7 @@ def admin_router():
         items = (
             await session.scalars(
                 select(Product)
-                .where(Product.featured.is_(True), Product.deleted_at.is_(None))
+                .where(Product.on_home.is_(True), Product.deleted_at.is_(None))
                 .order_by(Product.featured_position, Product.id)
                 .with_for_update()
             )
@@ -386,7 +657,7 @@ def admin_router():
         if not pid:
             return
         p = await session.get(Product, pid)
-        p.deleted_at, p.visible, p.featured = now(), False, False
+        p.deleted_at, p.visible, p.featured, p.on_home = now(), False, False, False
         audit(session, callback.from_user.id, "product_delete", pid)
         await session.commit()
         await state.clear()
@@ -478,12 +749,21 @@ def admin_router():
             .select_from(Product)
             .where(Product.visible.is_(True), Product.deleted_at.is_(None))
         )
-        text = f"📊 Статистика\nКористувачів: {users}\nПокупців: {buyers}\nПродажів: {sales}\nВиручка: {money(revenue)}\nАктивних товарів: {active}\n"
+        text = (
+            "📊 <b>Статистика магазину</b>\n\n"
+            "👥 <b>Загальні показники</b>\n"
+            f"👤 Користувачів: <b>{users}</b>\n"
+            f"🛒 Покупців: <b>{buyers}</b>\n"
+            f"🎮 Продажів: <b>{sales}</b>\n"
+            f"💰 Загальна виручка: <b>{money(revenue)}</b>\n"
+            f"📦 Активних товарів: <b>{active}</b>\n\n"
+            "📈 <b>Продажі за період</b>"
+        )
         local = now().astimezone(ZoneInfo(shop.cfg.timezone))
-        for label, start in [
-            ("Сьогодні", local.replace(hour=0, minute=0, second=0, microsecond=0)),
-            ("7 днів", now() - timedelta(days=7)),
-            ("30 днів", now() - timedelta(days=30)),
+        for icon, label, start in [
+            ("☀️", "Сьогодні", local.replace(hour=0, minute=0, second=0, microsecond=0)),
+            ("📅", "За 7 днів", now() - timedelta(days=7)),
+            ("🗓", "За 30 днів", now() - timedelta(days=30)),
         ]:
             count, amount = (
                 await session.execute(
@@ -492,7 +772,7 @@ def admin_router():
                     )
                 )
             ).one()
-            text += f"\n{label}: {count} / {money(amount)}"
+            text += f"\n{icon} {label}: <b>{count}</b> · <b>{money(amount)}</b>"
         top = (
             await session.execute(
                 select(Product.name_ua, func.count(Order.id))
@@ -503,7 +783,14 @@ def admin_router():
                 .limit(5)
             )
         ).all()
-        text += "\n\nНайпопулярніші:\n" + "\n".join(f"{escape(name)}: {count}" for name, count in top)
+        medals = ("🥇", "🥈", "🥉", "4️⃣", "5️⃣")
+        if top:
+            text += "\n\n🏆 <b>Найпопулярніші ігри</b>\n" + "\n".join(
+                f"{medals[index]} {escape(name)} — <b>{count}</b>"
+                for index, (name, count) in enumerate(top)
+            )
+        else:
+            text += "\n\n🏆 <b>Найпопулярніші ігри</b>\nПоки немає продажів"
         await render(callback, text, [BACK])
 
     @router.callback_query(F.data == "a:settings")
@@ -617,7 +904,11 @@ def admin_router():
     async def broadcast_confirm(callback, state, session):
         if not (await state.get_data()).get("broadcast"):
             return
-        total = await session.scalar(select(func.count()).select_from(User).where(User.blocked.is_(False)))
+        total = await session.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(User.blocked.is_(False), User.broadcast_subscribed.is_(True))
+        )
         await state.update_data(broadcast_confirmed=True)
         await render(
             callback,

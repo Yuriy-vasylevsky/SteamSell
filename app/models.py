@@ -22,6 +22,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    broadcast_subscribed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
 
 class Product(Base):
@@ -39,6 +40,7 @@ class Product(Base):
     gmail_credentials_encrypted: Mapped[str | None] = mapped_column(Text)
     visible: Mapped[bool] = mapped_column(Boolean, default=True)
     featured: Mapped[bool] = mapped_column(Boolean, default=False)
+    on_home: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     featured_position: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
@@ -127,6 +129,7 @@ class MailCodeRequest(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    order_id: Mapped[str | None] = mapped_column(ForeignKey("orders.id"), index=True)
     outcome: Mapped[str] = mapped_column(String(32))
     message_id: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

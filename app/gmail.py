@@ -34,15 +34,67 @@ def parse_steam_code(message, login, earliest, current=None):
         return None
     # Do not distribute account recovery, password reset, or email-change codes.
     subject = headers.get("subject", "").lower()
-    if not any(
-        marker in subject for marker in ("access from new", "new sign in", "нового комп", "нового пристро")
-    ):
+    if not _is_safe_subject(subject):
         return None
     text = body_text(payload)
     if not re.search(r"(?<![\w])" + re.escape(login) + r"(?![\w])", text, re.IGNORECASE):
         return None
-    codes = set(re.findall(r"(?m)^\s*([A-Z0-9]{5})\s*$", text))
+    codes = _steam_codes(text)
     return next(iter(codes)) if len(codes) == 1 else None
+
+
+def _is_safe_subject(subject):
+    blocked = (
+        "password",
+        "recovery",
+        "recover",
+        "email change",
+        "change your email",
+        "зміна пошти",
+        "відновлення пароля",
+        "смена почты",
+        "восстановление пароля",
+        "contraseña",
+        "mot de passe",
+        "passwort",
+        "senha",
+    )
+    return not any(marker in subject for marker in blocked)
+
+
+def _steam_codes(text):
+    return set(
+        re.findall(
+            r"(?i:steam\s*guard)(?s:.{0,500}?)\b([A-Z0-9]{5})\b",
+            text,
+        )
+    )
+
+
+def parse_latest_steam_code(message, accounts, earliest, current=None):
+    current = current or datetime.now(UTC)
+    timestamp = datetime.fromtimestamp(int(message.get("internalDate", 0)) / 1000, UTC)
+    if timestamp < earliest or timestamp > current:
+        return None
+    payload = message.get("payload", {})
+    headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+    if parseaddr(headers.get("from", ""))[1].lower() != "noreply@steampowered.com":
+        return None
+    subject = headers.get("subject", "").lower()
+    if not _is_safe_subject(subject):
+        return None
+    text = body_text(payload)
+    codes = _steam_codes(text)
+    if len(codes) != 1:
+        return None
+    searchable = subject + "\n" + text
+    matches = [
+        (login, game)
+        for login, game in accounts
+        if re.search(r"(?<![\w])" + re.escape(login) + r"(?![\w])", searchable, re.IGNORECASE)
+    ]
+    login, game = matches[0] if len(matches) == 1 else ("—", "Гру не вдалося визначити")
+    return next(iter(codes)), login, game, timestamp
 
 
 class Gmail:
@@ -112,4 +164,27 @@ class Gmail:
             code = parse_steam_code(message, login, earliest)
             if code:
                 return code, message["id"]
+        return None
+
+    async def latest_code_for_accounts(self, credentials, accounts, earliest):
+        token = (
+            await self.token(
+                grant_type="refresh_token",
+                refresh_token=credentials["refresh_token"],
+            )
+        )["access_token"]
+        result = await self.get(
+            "messages",
+            token,
+            q=f"from:noreply@steampowered.com after:{int(earliest.timestamp())}",
+            maxResults=20,
+        )
+        messages = [
+            await self.get("messages/" + item["id"], token, format="full")
+            for item in result.get("messages", [])
+        ]
+        for message in sorted(messages, key=lambda item: int(item["internalDate"]), reverse=True):
+            parsed = parse_latest_steam_code(message, accounts, earliest)
+            if parsed:
+                return parsed
         return None

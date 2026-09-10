@@ -1,7 +1,14 @@
+from datetime import UTC
 from html import escape
+from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from app.i18n import money, tr
 
@@ -29,8 +36,6 @@ def home_rows(lang):
     return [
         [(tr("featured", lang), "featured:0"), (tr("catalog", lang), "catalog:0")],
         [(tr("purchases", lang), "purchases:0")],
-        [(tr("info", lang), "info"), (tr("support", lang), "support")],
-        [(tr("language", lang), "language")],
     ]
 
 
@@ -73,27 +78,88 @@ def product_text(product, lang):
 
 
 def purchase_text(order, product, lang, vault):
+    paid_at = order.paid_at
+    if paid_at.tzinfo is None:
+        paid_at = paid_at.replace(tzinfo=UTC)
+    paid_at = paid_at.astimezone(ZoneInfo("Europe/Kyiv"))
+    login = escape(vault.decrypt(product.steam_login_encrypted))
+    password = escape(vault.decrypt(product.steam_password_encrypted))
+    paid_title = "Оплата успішна!" if lang == "ua" else "Оплата успешна!"
+    credentials_title = "Дані Steam" if lang == "ua" else "Данные Steam"
+    login_label = "Логін" if lang == "ua" else "Логин"
     return (
-        f"{tr('paid', lang)}\n\n<b>{escape(order.product_name_snapshot)}</b>\n"
-        f"{money(order.price_snapshot)}\n{tr('date', lang)}: {order.paid_at:%Y-%m-%d %H:%M} UTC\n\n"
-        f"Steam Login:\n<code>{escape(vault.decrypt(product.steam_login_encrypted))}</code>\n\n"
-        f"Steam Password:\n<code>{escape(vault.decrypt(product.steam_password_encrypted))}</code>\n\n"
-        f"{tr('notice', lang)}"
+        f"✅ <b>{paid_title}</b>\n\n"
+        f"🎮 <b>{escape(order.product_name_snapshot)}</b>\n"
+        f"💰 {money(order.price_snapshot)}\n"
+        f"🗓 {paid_at:%d.%m.%Y · %H:%M}\n\n"
+        f"🔐 <b>{credentials_title}</b>\n"
+        f"👤 {login_label}: <code>{login}</code>\n"
+        f"🔑 Пароль: <code>{password}</code>\n\n"
+        f"⚠️ {tr('notice', lang)}"
     )
 
 
 def payment_rows(order, lang):
+    cancel = [
+        (
+            "❌ Скасувати платіж" if lang == "ua" else "❌ Отменить платёж",
+            f"cancel_payment:{order.id}",
+        )
+    ]
     if order.payment_method == "personal":
-        return [[("🔎 Перевірити платіж" if lang == "ua" else "🔎 Проверить платёж", f"check_payment:{order.id}")], back(lang)]
+        return [
+            [
+                (
+                    "🔎 Перевірити платіж" if lang == "ua" else "🔎 Проверить платёж",
+                    f"check_payment:{order.id}",
+                )
+            ],
+            cancel,
+        ]
     if order.payment_method == "receipt":
-        return [[("📎 Надіслати скрін оплати" if lang == "ua" else "📎 Отправить скрин оплаты", f"receipt:{order.id}")], back(lang)]
-    return ([[(tr("pay", lang), order.payment_url)]] if order.payment_url else []) + [back(lang)]
+        return [
+            [
+                (
+                    "📎 Надіслати скрін оплати" if lang == "ua" else "📎 Отправить скрин оплаты",
+                    f"receipt:{order.id}",
+                )
+            ],
+            cancel,
+        ]
+    return ([[(tr("pay", lang), order.payment_url)]] if order.payment_url else []) + [cancel]
+
+
+def persistent_menu(lang, admin=False, subscribed=False):
+    newsletter = KeyboardButton(
+        text=(
+            "🔕 Відписатися від розсилки"
+            if subscribed and lang == "ua"
+            else "🔕 Отписаться от рассылки"
+            if subscribed
+            else "📨 Підписатися на розсилку"
+            if lang == "ua"
+            else "📨 Подписаться на рассылку"
+        )
+    )
+    rows = [
+        [KeyboardButton(text=tr("featured", lang)), KeyboardButton(text=tr("catalog", lang))],
+        [KeyboardButton(text=tr("purchases", lang))],
+        [KeyboardButton(text=tr("info", lang)), KeyboardButton(text=tr("support", lang))],
+        [KeyboardButton(text=tr("language", lang)), newsletter],
+    ]
+    if admin:
+        rows.append([KeyboardButton(text="⚙️ Адмін-панель")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Оберіть розділ" if lang == "ua" else "Выберите раздел",
+    )
 
 
 def payment_wait_text(order, lang, step=0, card=""):
-    frames = ("⏳", "⌛", "⏳·", "⏳··", "⏳···")
     text = (
-        f"{frames[step % len(frames)]} {tr('payment_waiting', lang)}\n\n"
+        f"{tr('payment_waiting', lang)}\n\n"
         f"<b>{escape(order.product_name_snapshot)}</b>\n{money(order.price_snapshot)}"
     )
     if order.payment_method == "personal":
@@ -110,13 +176,15 @@ def payment_wait_text(order, lang, step=0, card=""):
     return text
 
 
-def purchase_rows(order, lang, support, gmail_connected=True):
+def purchase_rows(order, lang, support, gmail_connected=True, code_requests_remaining=2):
     rows = []
     if gmail_connected:
-        rows.append([(tr("code", lang), f"code:{order.id}")])
+        label = f"{tr('code', lang)} · {'ще' if lang == 'ua' else 'ещё'} {code_requests_remaining}"
+        rows.append([(label, f"code:{order.id}" if code_requests_remaining else "noop")])
     rows.extend(
         [
-            [(tr("support", lang), "https://t.me/" + support.lstrip("@"))],
+            [(tr("activation_guide", lang), f"activation_guide:{order.id}")],
+            [(tr("usage_rules", lang), f"usage_rules:{order.id}")],
             [(tr("home", lang), "home")],
         ]
     )

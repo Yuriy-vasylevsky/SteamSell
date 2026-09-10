@@ -114,12 +114,13 @@ async def test_admin_product_wizard_edit_and_confirmed_delete(shop):
     await send(callback="a:oauth")
     await send(callback="a:gmail_done")
     await send(callback="a:feature:1")
+    await send(callback="a:feature:1")
     async with shop.sessions() as session:
         assert await session.scalar(select(Product).where(Product.name_ua == "Нова гра")) is None
     await send(callback="a:save")
     async with shop.sessions() as session:
         p = await session.scalar(select(Product).where(Product.name_ua == "Нова гра"))
-        assert p and p.price == 59950 and p.featured and not p.image_file_id
+        assert p and p.price == 59950 and p.featured and p.on_home and not p.image_file_id
         assert p.name_ua == p.name_ru == "Нова гра"
         assert p.description_ua == p.description_ru == ""
         assert shop.vault.decrypt(p.steam_password_encrypted) == "new_password"
@@ -158,6 +159,7 @@ async def test_admin_can_create_product_without_gmail(shop):
     await send(text="login")
     await send(text="password")
     await send(callback="a:skip")  # Gmail
+    await send(callback="a:feature:0")
     await send(callback="a:feature:0")
     await send(callback="a:save")
 

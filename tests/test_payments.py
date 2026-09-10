@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import func, select
 
-from app.models import Order, PaymentEvent, Product
-from app.services import ShopError, set_setting
-from app.worker import animate_waiting_payments, deliver_one
+from app.models import Order, PaymentCard, PaymentEvent, PaymentReceipt, Product, now
+from app.services import ShopError, has_recent_purchase, set_setting
+from app.worker import deliver_one
 
 
 async def test_repeated_webhook_delivers_once(shop, payment):
@@ -106,21 +106,69 @@ async def test_checkout_allows_product_without_gmail(shop):
     assert order.mono_invoice_id == "without-mail"
 
 
-async def test_payment_message_is_saved_and_animated(shop):
+async def test_deepseek_checkout_snapshots_active_cards(shop):
+    async with shop.sessions() as session, session.begin():
+        await set_setting(session, "payment_mode", "deepseek")
+        session.add_all(
+            [
+                PaymentCard(
+                    label="Mono", number_encrypted=shop.vault.encrypt("4441111043425077"), last4="5077"
+                ),
+                PaymentCard(
+                    label="Other", number_encrypted=shop.vault.encrypt("4111111111111234"), last4="1234"
+                ),
+            ]
+        )
+    order = await shop.checkout(1, 1)
+    assert order.payment_method == "receipt"
+    cards = shop.vault.unpack(order.payment_cards_encrypted)["cards"]
+    assert [(card["label"], card["last4"]) for card in cards] == [("Mono", "5077"), ("Other", "1234")]
+    shop.mono.create.assert_not_awaited()
+
+
+async def test_payment_message_is_saved_without_animation(shop):
     async with shop.sessions() as session, session.begin():
         order = await session.get(Order, "a" * 32)
         order.payment_url = "https://pay.test/invoice1"
     await shop.attach_payment_message("a" * 32, 1, 321)
-    async with shop.sessions() as session, session.begin():
-        (await session.get(Order, "a" * 32)).payment_animation_at = None
-    bot = AsyncMock()
-    await animate_waiting_payments(shop, bot)
-    bot.edit_message_text.assert_awaited_once()
-    call = bot.edit_message_text.call_args
-    assert call.kwargs["chat_id"] == 1
-    assert call.kwargs["message_id"] == 321
-    assert "Очікуємо підтвердження оплати" in call.args[0]
     async with shop.sessions() as session:
         order = await session.get(Order, "a" * 32)
-        assert order.payment_animation_step == 1
-        assert order.payment_animation_at is not None
+        assert order.payment_message_id == 321
+        assert order.payment_animation_step == 0
+        assert order.payment_animation_at is None
+
+
+async def test_user_can_cancel_waiting_payment(shop):
+    order = await shop.cancel_payment("a" * 32, 1)
+    assert order.status == "cancelled"
+    async with shop.sessions() as session:
+        assert (await session.get(Order, "a" * 32)).status == "cancelled"
+    with pytest.raises(ShopError, match="missing"):
+        await shop.cancel_payment("a" * 32, 1)
+
+
+async def test_manual_receipt_review_blocks_checkout_and_cancellation(shop):
+    async with shop.sessions() as session, session.begin():
+        session.add(
+            PaymentReceipt(
+                order_id="a" * 32,
+                user_id=1,
+                telegram_file_id="photo",
+                file_sha256="hash",
+                status="manual_review",
+            )
+        )
+    with pytest.raises(ShopError, match="receipt_pending"):
+        await shop.checkout(1, 1)
+    with pytest.raises(ShopError, match="receipt_locked"):
+        await shop.cancel_payment("a" * 32, 1)
+
+
+async def test_recent_purchase_requires_manual_receipt_review(shop):
+    checked_at = now()
+    async with shop.sessions() as session, session.begin():
+        previous = await session.get(Order, "a" * 32)
+        previous.status = "delivered"
+        previous.paid_at = checked_at
+        assert await has_recent_purchase(session, 1, "b" * 32, checked_at)
+        assert not await has_recent_purchase(session, 2, "b" * 32, checked_at)

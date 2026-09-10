@@ -5,7 +5,18 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 
-from app.models import AdminLog, MailCodeRequest, Order, PaymentCard, PaymentEvent, Product, Setting, User, now
+from app.models import (
+    AdminLog,
+    MailCodeRequest,
+    Order,
+    PaymentCard,
+    PaymentEvent,
+    PaymentReceipt,
+    Product,
+    Setting,
+    User,
+    now,
+)
 
 log = logging.getLogger(__name__)
 SUCCESS = ("paid", "delivered")
@@ -24,12 +35,53 @@ async def setting(session, key, default=""):
     return row.value if row else default
 
 
+async def configured_manual_card(session, shop):
+    encrypted = await setting(session, "manual_card", "")
+    if encrypted:
+        try:
+            return shop.vault.decrypt(encrypted)
+        except Exception:
+            log.warning("manual_card_setting_invalid")
+    return getattr(shop.cfg, "manual_card", "")
+
+
+async def shared_gmail_credentials(session, shop):
+    encrypted = await session.scalar(
+        select(Product.gmail_credentials_encrypted)
+        .where(
+            Product.gmail_credentials_encrypted.is_not(None),
+            Product.deleted_at.is_(None),
+        )
+        .order_by(Product.id.desc())
+        .limit(1)
+    )
+    return shop.vault.unpack(encrypted) if encrypted else None
+
+
 async def set_setting(session, key, value):
     row = await session.get(Setting, key)
     if row:
         row.value = value
     else:
         session.add(Setting(key=key, value=value))
+
+
+async def has_recent_purchase(session, user_id, order_id, checked_at, minutes=12):
+    checked_at = aware(checked_at)
+    return bool(
+        await session.scalar(
+            select(Order.id)
+            .where(
+                Order.user_id == user_id,
+                Order.id != order_id,
+                Order.status.in_(SUCCESS),
+                Order.paid_at.is_not(None),
+                Order.paid_at >= checked_at - timedelta(minutes=minutes),
+                Order.paid_at <= checked_at,
+            )
+            .limit(1)
+        )
+    )
 
 
 def audit(session, admin_id, action, target):
@@ -45,17 +97,33 @@ class Shop:
         async with self.sessions() as session:
             if await setting(session, "enabled", "true") != "true":
                 raise ShopError("maintenance")
+            pending_receipt = await session.scalar(
+                select(PaymentReceipt.id)
+                .join(Order, Order.id == PaymentReceipt.order_id)
+                .where(
+                    Order.user_id == user_id,
+                    PaymentReceipt.status.in_(("analyzing", "manual_review")),
+                )
+                .limit(1)
+            )
+            if pending_receipt:
+                raise ShopError("receipt_pending")
             product = await session.get(Product, product_id)
             if not product or not product.visible or product.deleted_at:
                 raise ShopError("missing")
-            card = getattr(self.cfg, "manual_card", "")
+            card = await configured_manual_card(session, self)
             payment_mode = await setting(session, "payment_mode", "mono")
             target_method = "receipt" if payment_mode == "deepseek" else ("personal" if card else "acquiring")
             cards = []
             if target_method == "receipt":
-                cards = (await session.scalars(
-                    select(PaymentCard).where(PaymentCard.active.is_(True)).order_by(PaymentCard.id).limit(2)
-                )).all()
+                cards = (
+                    await session.scalars(
+                        select(PaymentCard)
+                        .where(PaymentCard.active.is_(True))
+                        .order_by(PaymentCard.id)
+                        .limit(2)
+                    )
+                ).all()
                 if not cards:
                     raise ShopError("payment_unavailable")
             user = await session.get(User, user_id)
@@ -82,8 +150,20 @@ class Shop:
                 price_snapshot=product.price,
                 payment_method=target_method,
                 payment_cards_encrypted=(
-                    self.vault.pack({"cards": [{"label": c.label, "number": self.vault.decrypt(c.number_encrypted), "last4": c.last4} for c in cards]})
-                    if cards else None
+                    self.vault.pack(
+                        {
+                            "cards": [
+                                {
+                                    "label": c.label,
+                                    "number": self.vault.decrypt(c.number_encrypted),
+                                    "last4": c.last4,
+                                }
+                                for c in cards
+                            ]
+                        }
+                    )
+                    if cards
+                    else None
                 ),
             )
             session.add(order)
@@ -172,7 +252,35 @@ class Shop:
             order = await session.get(Order, order_id)
             if order and order.user_id == user_id and order.status == "waiting_payment":
                 order.payment_message_id = message_id
-                order.payment_animation_at = now()
+
+    async def cancel_payment(self, order_id, user_id):
+        async with self.sessions() as session, session.begin():
+            order = await session.get(Order, order_id, with_for_update=True)
+            if not order or order.user_id != user_id or order.status != "waiting_payment":
+                raise ShopError("missing")
+            if await session.scalar(
+                select(PaymentReceipt.id)
+                .where(
+                    PaymentReceipt.order_id == order.id,
+                )
+                .limit(1)
+            ):
+                raise ShopError("receipt_locked")
+            order.status = "cancelled"
+            receipts = (
+                await session.scalars(
+                    select(PaymentReceipt)
+                    .where(
+                        PaymentReceipt.order_id == order.id,
+                        PaymentReceipt.status.in_(("analyzing", "manual_review")),
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            for receipt in receipts:
+                receipt.status = "cancelled"
+                receipt.reason = "Платіж скасовано покупцем"
+            return order
 
     async def code(self, user_id, order_id):
         async with self.sessions() as session:
@@ -180,7 +288,22 @@ class Shop:
             if not order or order.user_id != user_id or order.status not in SUCCESS:
                 raise ShopError("missing")
             product = await session.get(Product, order.product_id)
-            request = MailCodeRequest(user_id=user_id, product_id=product.id, outcome="requested")
+            found_count = await session.scalar(
+                select(func.count())
+                .select_from(MailCodeRequest)
+                .where(
+                    MailCodeRequest.order_id == order.id,
+                    MailCodeRequest.outcome == "found",
+                )
+            )
+            if found_count >= 3:
+                raise ShopError("code_limit")
+            request = MailCodeRequest(
+                user_id=user_id,
+                product_id=product.id,
+                order_id=order.id,
+                outcome="requested",
+            )
             session.add(request)
             # Atomic cross-process throttle, both per user and per shared Steam account.
             allowed = await self.redis.eval(
@@ -209,11 +332,15 @@ class Shop:
                 await session.commit()
                 raise ShopError("cooldown")
             try:
-                if not product.gmail_credentials_encrypted:
+                credentials = await shared_gmail_credentials(session, self)
+                if not credentials:
                     raise ValueError("gmail_not_connected")
-                earliest = max(now() - timedelta(seconds=self.cfg.code_max_age), aware(order.paid_at))
+                # A buyer may return through "My purchases" after the original
+                # three-minute polling window. Keep the login match strict, but
+                # allow the same one-hour mailbox window as the admin lookup.
+                earliest = max(now() - timedelta(hours=1), aware(order.paid_at))
                 result = await self.gmail.latest_code(
-                    self.vault.unpack(product.gmail_credentials_encrypted),
+                    credentials,
                     self.vault.decrypt(product.steam_login_encrypted),
                     earliest,
                 )
@@ -222,7 +349,7 @@ class Shop:
                     seen = await session.scalar(
                         select(MailCodeRequest.id).where(
                             MailCodeRequest.user_id == user_id,
-                            MailCodeRequest.product_id == product.id,
+                            MailCodeRequest.order_id == order.id,
                             MailCodeRequest.message_id == message_id,
                             MailCodeRequest.outcome == "found",
                         )

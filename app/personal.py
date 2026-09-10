@@ -1,4 +1,5 @@
 """Only authenticated statement responses can confirm a personal transfer."""
+
 import asyncio
 import hashlib
 import logging
@@ -9,7 +10,7 @@ from urllib.parse import quote
 from sqlalchemy import select
 
 from app.models import Order, PaymentEvent, now
-from app.services import aware
+from app.services import aware, configured_manual_card
 
 log = logging.getLogger(__name__)
 
@@ -17,10 +18,15 @@ log = logging.getLogger(__name__)
 async def resolve_account(client, token, card):
     response = await client.get("https://api.monobank.ua/personal/client-info", headers={"X-Token": token})
     response.raise_for_status()
-    matches = [a for a in response.json().get("accounts", []) if a.get("currencyCode") == 980 and any(
-        len(mask) == len(card) and all(m == "*" or m == c for m, c in zip(mask, card))
-        for mask in a.get("maskedPan", [])
-    )]
+    matches = [
+        a
+        for a in response.json().get("accounts", [])
+        if a.get("currencyCode") == 980
+        and any(
+            len(mask) == len(card) and all(m == "*" or m == c for m, c in zip(mask, card))
+            for mask in a.get("maskedPan", [])
+        )
+    ]
     if len(matches) != 1:
         raise ValueError("card_account_not_unique")
     return matches[0]["id"]
@@ -28,21 +34,37 @@ async def resolve_account(client, token, card):
 
 async def apply_statement(shop, account, entries, order_id=None):
     async with shop.sessions() as session, session.begin():
-        orders = (await session.scalars(select(Order).where(
-            Order.payment_method == "personal", Order.status == "waiting_payment",
-            Order.created_at >= now() - timedelta(days=30),
-            Order.id == order_id if order_id else True,
-        ).order_by(Order.created_at, Order.id).with_for_update())).all()
+        orders = (
+            await session.scalars(
+                select(Order)
+                .where(
+                    Order.payment_method == "personal",
+                    Order.status == "waiting_payment",
+                    Order.created_at >= now() - timedelta(days=30),
+                    Order.id == order_id if order_id else True,
+                )
+                .order_by(Order.created_at, Order.id)
+                .with_for_update()
+            )
+        ).all()
         for item in entries:
-            if (not isinstance(item.get("id"), str) or not item["id"]
-                or type(item.get("amount")) is not int or item["amount"] <= 0
+            if (
+                not isinstance(item.get("id"), str)
+                or not item["id"]
+                or type(item.get("amount")) is not int
+                or item["amount"] <= 0
                 or item.get("currencyCode") != 980
-                or type(item.get("time")) is not int):
+                or type(item.get("time")) is not int
+            ):
                 continue
-            matches = [o for o in orders if o.status == "waiting_payment"
-                       and item["amount"] == o.price_snapshot
-                       and item["time"] >= int(aware(o.created_at).timestamp())
-                       and item["time"] <= int(now().timestamp())]
+            matches = [
+                o
+                for o in orders
+                if o.status == "waiting_payment"
+                and item["amount"] == o.price_snapshot
+                and item["time"] >= int(aware(o.created_at).timestamp())
+                and item["time"] <= int(now().timestamp())
+            ]
             if not matches:
                 continue
             digest = hashlib.sha256(("personal:" + account + ":" + item["id"]).encode()).hexdigest()
@@ -62,17 +84,24 @@ async def reconcile_personal(shop, order_id):
 
 
 async def _reconcile_personal(shop, order_id):
-    card = getattr(shop.cfg, "manual_card", "")
+    async with shop.sessions() as session:
+        card = await configured_manual_card(session, shop)
     if not card or time.monotonic() < getattr(shop, "personal_next", 0):
         return "cooldown"
-    shop.personal_next = time.monotonic() + 65
+    shop.personal_next = time.monotonic() + 20
     try:
         async with shop.sessions() as session:
-            pending = await session.scalar(select(Order).where(
-                Order.payment_method == "personal", Order.status == "waiting_payment",
-                Order.created_at >= now() - timedelta(days=30),
-                Order.id == order_id,
-            ).order_by(Order.created_at).limit(1))
+            pending = await session.scalar(
+                select(Order)
+                .where(
+                    Order.payment_method == "personal",
+                    Order.status == "waiting_payment",
+                    Order.created_at >= now() - timedelta(days=30),
+                    Order.id == order_id,
+                )
+                .order_by(Order.created_at)
+                .limit(1)
+            )
         if not pending:
             return "empty"
         token = shop.cfg.mono_token.get_secret_value()
