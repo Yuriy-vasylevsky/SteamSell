@@ -109,6 +109,11 @@ async def test_checkout_allows_product_without_gmail(shop):
 async def test_deepseek_checkout_snapshots_active_cards(shop):
     async with shop.sessions() as session, session.begin():
         await set_setting(session, "payment_mode", "deepseek")
+        await set_setting(
+            session,
+            "receipt_iban",
+            shop.vault.encrypt("UA123456789012345678901234567"),
+        )
         session.add_all(
             [
                 PaymentCard(
@@ -123,7 +128,37 @@ async def test_deepseek_checkout_snapshots_active_cards(shop):
     assert order.payment_method == "receipt"
     cards = shop.vault.unpack(order.payment_cards_encrypted)["cards"]
     assert [(card["label"], card["last4"]) for card in cards] == [("Mono", "5077"), ("Other", "1234")]
+    assert shop.vault.unpack(order.payment_cards_encrypted)["ibans"] == [
+        "UA123456789012345678901234567"
+    ]
     shop.mono.create.assert_not_awaited()
+
+
+async def test_hybrid_mode_requires_and_respects_buyer_choice(shop):
+    async with shop.sessions() as session, session.begin():
+        await set_setting(session, "payment_mode", "hybrid")
+        session.add(
+            PaymentCard(
+                label="Card",
+                number_encrypted=shop.vault.encrypt("4441111043425077"),
+                last4="5077",
+            )
+        )
+    with pytest.raises(ShopError, match="missing"):
+        await shop.checkout(1, 1)
+
+    shop.mono.create.return_value = {
+        "invoiceId": "hybrid-mono",
+        "pageUrl": "https://pay.test/hybrid-mono",
+    }
+    mono_order = await shop.checkout(1, 1, "mono")
+    assert mono_order.payment_method == "acquiring"
+    assert mono_order.mono_invoice_id == "hybrid-mono"
+
+    receipt_order = await shop.checkout(2, 1, "deepseek")
+    assert receipt_order.payment_method == "receipt"
+    cards = shop.vault.unpack(receipt_order.payment_cards_encrypted)["cards"]
+    assert cards[0]["last4"] == "5077"
 
 
 async def test_payment_message_is_saved_without_animation(shop):

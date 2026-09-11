@@ -8,10 +8,19 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import MessageEntity
 from sqlalchemy import select
 
-from app.i18n import money, tr
+from app.access import is_admin
+from app.i18n import tr
 from app.models import Broadcast, Order, Product, User, now
 from app.services import aware, setting, shared_gmail_credentials
-from app.ui import back, keyboard, purchase_rows, purchase_text
+from app.ui import (
+    back,
+    discounted_price_text,
+    keyboard,
+    manual_delivery_text,
+    persistent_menu,
+    purchase_rows,
+    purchase_text,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +47,22 @@ async def deliver_one(shop, bot):
         product = await session.get(Product, order.product_id)
         lang = user.language or "ua"
         support = await setting(session, "support_username", shop.cfg.support_username)
-        gmail_connected = bool(await shared_gmail_credentials(session, shop))
-        text = purchase_text(order, product, lang, shop.vault)
-        markup = keyboard(purchase_rows(order, lang, support, gmail_connected))
+        if order.delivery_mode_snapshot == "manual":
+            text = manual_delivery_text(order, lang)
+            markup = keyboard([[(tr("support", lang), "https://t.me/" + support.lstrip("@"))]])
+        else:
+            gmail_connected = bool(await shared_gmail_credentials(session, shop))
+            text = purchase_text(order, product, lang, shop.vault)
+            markup = keyboard(
+                purchase_rows(
+                    order,
+                    lang,
+                    support,
+                    gmail_connected,
+                    product.code_limit,
+                    code_request_available=True,
+                )
+            )
     try:
         message = await bot.send_message(
             user.id, text, parse_mode="HTML", reply_markup=markup, protect_content=True
@@ -65,7 +87,9 @@ async def deliver_one(shop, bot):
     if payment_message_id:
         try:
             await bot.edit_message_text(
-                tr("payment_confirmed", lang),
+                tr("manual_delivery", lang)
+                if order.delivery_mode_snapshot == "manual"
+                else tr("payment_confirmed", lang),
                 chat_id=user.id,
                 message_id=payment_message_id,
                 reply_markup=keyboard([[back(lang)[0]]]),
@@ -98,6 +122,9 @@ async def notify_admin(shop, bot):
                     continue
             user = await session.get(User, order.user_id)
             status = (
+                "👤 Очікується ручна видача адміністратором."
+                if order.delivery_mode_snapshot == "manual"
+                else
                 "📦 Дані видано"
                 if order.status == "delivered"
                 else "⚠️ Видача потребує перевірки; покупка доступна у «Мої покупки»."
@@ -108,7 +135,7 @@ async def notify_admin(shop, bot):
                     shop.cfg.admin_id,
                     "💰 <b>Нова покупка</b>\n\n"
                     f"🎮 {escape(order.product_name_snapshot)}\n"
-                    f"💵 {money(order.price_snapshot)}\n"
+                    f"💵 {discounted_price_text(order.original_price_snapshot or order.price_snapshot, order.discount_percent_snapshot)}\n"
                     f"👤 @{escape(user.username or '—')}\n"
                     f"🆔 ID: <code>{user.id}</code>\n\n"
                     f"{status}\n"
@@ -128,28 +155,37 @@ async def broadcast_batch(shop, bot):
         )
         if not job:
             return
-        users = (
-            await session.scalars(
-                select(User)
-                .where(
-                    User.id > job.last_user_id,
-                    User.blocked.is_(False),
-                    User.broadcast_subscribed.is_(True),
-                    User.created_at <= job.created_at,
-                )
-                .order_by(User.id)
-                .limit(20)
-            )
-        ).all()
+        payload = job.payload
+        menu_refresh = payload.get("type") == "menu_refresh"
+        user_query = select(User).where(
+            User.id > job.last_user_id,
+            User.blocked.is_(False),
+            User.created_at <= job.created_at,
+        )
+        if not menu_refresh:
+            user_query = user_query.where(User.broadcast_subscribed.is_(True))
+        users = (await session.scalars(user_query.order_by(User.id).limit(20))).all()
+        loyalty_enabled = await setting(session, "loyalty_enabled", "true") == "true"
         for user in users:
-            payload = job.payload
-            entities = [MessageEntity.model_validate(e) for e in payload["entities"]]
             try:
-                if payload["photo"]:
+                if menu_refresh:
+                    await bot.send_message(
+                        user.id,
+                        "\u2063",
+                        reply_markup=persistent_menu(
+                            user.language or "ua",
+                            is_admin(shop.cfg, user.id),
+                            user.broadcast_subscribed,
+                            loyalty_enabled,
+                        ),
+                    )
+                elif payload["photo"]:
+                    entities = [MessageEntity.model_validate(e) for e in payload["entities"]]
                     await bot.send_photo(
                         user.id, payload["photo"], caption=payload["text"], caption_entities=entities
                     )
                 else:
+                    entities = [MessageEntity.model_validate(e) for e in payload["entities"]]
                     await bot.send_message(user.id, payload["text"], entities=entities)
                 job.delivered += 1
             except TelegramForbiddenError:
@@ -167,9 +203,10 @@ async def broadcast_batch(shop, bot):
         if not users:
             job.status = "completed"
             await session.commit()
+            result_title = "Оновлення меню" if menu_refresh else "Розсилка"
             await bot.send_message(
                 shop.cfg.admin_id,
-                f"Розсилка #{job.id} завершена.\n"
+                f"{result_title} #{job.id} завершено.\n"
                 f"Доставлено: {job.delivered}\nЗаблокували: {job.blocked}\nПомилки: {job.errors}",
             )
 

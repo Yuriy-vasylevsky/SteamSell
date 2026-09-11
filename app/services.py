@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 
 from app.models import (
     AdminLog,
+    LoyaltyLevel,
     MailCodeRequest,
     Order,
     PaymentCard,
@@ -20,6 +21,7 @@ from app.models import (
 
 log = logging.getLogger(__name__)
 SUCCESS = ("paid", "delivered")
+TIP_PERCENTS = (0, 5, 10, 20)
 
 
 class ShopError(Exception):
@@ -66,6 +68,55 @@ async def set_setting(session, key, value):
         session.add(Setting(key=key, value=value))
 
 
+def apply_discount(price_kopecks: int, discount_percent: int) -> int:
+    if discount_percent <= 0:
+        return price_kopecks
+    # Round the discounted amount to the nearest whole hryvnia (half up).
+    discounted_hryvnias = (
+        price_kopecks * (100 - discount_percent) + 5_000
+    ) // 10_000
+    return max(100, discounted_hryvnias * 100)
+
+
+def tip_amount(price_kopecks: int, tip_percent: int) -> int:
+    if tip_percent not in TIP_PERCENTS:
+        raise ValueError("invalid_tip_percent")
+    return (price_kopecks * tip_percent + 50) // 100
+
+
+def price_with_tip(price_kopecks: int, tip_percent: int) -> int:
+    total = price_kopecks + tip_amount(price_kopecks, tip_percent)
+    return ((total + 50) // 100) * 100 if tip_percent else total
+
+
+async def loyalty_status(session, user_id):
+    enabled = await setting(session, "loyalty_enabled", "true") == "true"
+    spent = await session.scalar(
+        select(func.coalesce(func.sum(Order.price_snapshot), 0)).where(
+            Order.user_id == user_id,
+            Order.status.in_(SUCCESS),
+        )
+    )
+    levels = (
+        await session.scalars(select(LoyaltyLevel).order_by(LoyaltyLevel.threshold_kopecks))
+    ).all()
+    current = max(
+        (level for level in levels if level.threshold_kopecks <= spent),
+        key=lambda level: level.threshold_kopecks,
+        default=None,
+    )
+    next_level = next((level for level in levels if level.threshold_kopecks > spent), None)
+    discount = current.discount_percent if enabled and current else 0
+    return {
+        "enabled": enabled,
+        "spent": spent,
+        "levels": levels,
+        "current": current,
+        "next": next_level,
+        "discount_percent": discount,
+    }
+
+
 async def has_recent_purchase(session, user_id, order_id, checked_at, minutes=12):
     checked_at = aware(checked_at)
     return bool(
@@ -88,12 +139,20 @@ def audit(session, admin_id, action, target):
     session.add(AdminLog(admin_id=admin_id, action=action, target=str(target)))
 
 
+async def release_stock(session, product_id):
+    product = await session.get(Product, product_id, with_for_update=True)
+    if product and product.stock_quantity is not None:
+        product.stock_quantity += 1
+
+
 class Shop:
     def __init__(self, cfg, sessions, vault, mono, gmail, redis):
         self.cfg, self.sessions, self.vault = cfg, sessions, vault
         self.mono, self.gmail, self.redis = mono, gmail, redis
 
-    async def checkout(self, user_id, product_id):
+    async def checkout(self, user_id, product_id, payment_choice=None, tip_percent=0):
+        if tip_percent not in TIP_PERCENTS:
+            raise ShopError("missing")
         async with self.sessions() as session:
             if await setting(session, "enabled", "true") != "true":
                 raise ShopError("maintenance")
@@ -113,8 +172,19 @@ class Shop:
                 raise ShopError("missing")
             card = await configured_manual_card(session, self)
             payment_mode = await setting(session, "payment_mode", "mono")
-            target_method = "receipt" if payment_mode == "deepseek" else ("personal" if card else "acquiring")
+            if payment_mode == "hybrid":
+                if payment_choice not in {"mono", "deepseek"}:
+                    raise ShopError("missing")
+                effective_mode = payment_choice
+            else:
+                if payment_choice is not None and payment_choice != payment_mode:
+                    raise ShopError("missing")
+                effective_mode = payment_mode
+            target_method = (
+                "receipt" if effective_mode == "deepseek" else ("personal" if card else "acquiring")
+            )
             cards = []
+            receipt_iban = ""
             if target_method == "receipt":
                 cards = (
                     await session.scalars(
@@ -126,6 +196,12 @@ class Shop:
                 ).all()
                 if not cards:
                     raise ShopError("payment_unavailable")
+                encrypted_iban = await setting(session, "receipt_iban", "")
+                if encrypted_iban:
+                    try:
+                        receipt_iban = self.vault.decrypt(encrypted_iban)
+                    except Exception:
+                        log.warning("receipt_iban_setting_invalid")
             user = await session.get(User, user_id)
             # Repeated clicks return the same active invoice.
             existing = await session.scalar(
@@ -136,6 +212,7 @@ class Shop:
                     Order.status == "waiting_payment",
                     Order.created_at > now() - timedelta(minutes=55),
                     Order.payment_method == target_method,
+                    Order.tip_percent_snapshot == tip_percent,
                     (Order.payment_method.in_(("personal", "receipt"))) | Order.payment_url.is_not(None),
                 )
                 .order_by(Order.created_at.desc())
@@ -143,11 +220,23 @@ class Shop:
             )
             if existing:
                 return existing
+            product = await session.get(Product, product_id, with_for_update=True)
+            if product.stock_quantity is not None:
+                if product.stock_quantity <= 0:
+                    raise ShopError("missing")
+                product.stock_quantity -= 1
+            loyalty = await loyalty_status(session, user_id)
+            discount_percent = loyalty["discount_percent"]
+            product_price = apply_discount(product.price, discount_percent)
             order = Order(
                 user_id=user_id,
                 product_id=product_id,
                 product_name_snapshot=getattr(product, "name_" + (user.language or "ua")),
-                price_snapshot=product.price,
+                price_snapshot=price_with_tip(product_price, tip_percent),
+                original_price_snapshot=product.price,
+                discount_percent_snapshot=discount_percent,
+                tip_percent_snapshot=tip_percent,
+                delivery_mode_snapshot=product.delivery_mode,
                 payment_method=target_method,
                 payment_cards_encrypted=(
                     self.vault.pack(
@@ -159,7 +248,8 @@ class Shop:
                                     "last4": c.last4,
                                 }
                                 for c in cards
-                            ]
+                            ],
+                            "ibans": [receipt_iban] if receipt_iban else [],
                         }
                     )
                     if cards
@@ -180,6 +270,7 @@ class Shop:
                     await session.refresh(order)
                     if order.status not in SUCCESS:
                         order.status = "payment_failed"
+                        await release_stock(session, order.product_id)
                     await session.commit()
                     raise ShopError("error") from None
             return order
@@ -243,6 +334,7 @@ class Shop:
                 log.info("payment_confirmed order=%s", order.id)
             elif status in ("failure", "expired", "reversed") and order.status == "waiting_payment":
                 order.status = "payment_failed"
+                await release_stock(session, order.product_id)
                 event.outcome = "failed"
 
     async def attach_payment_message(self, order_id, user_id, message_id):
@@ -267,6 +359,7 @@ class Shop:
             ):
                 raise ShopError("receipt_locked")
             order.status = "cancelled"
+            await release_stock(session, order.product_id)
             receipts = (
                 await session.scalars(
                     select(PaymentReceipt)
@@ -296,7 +389,7 @@ class Shop:
                     MailCodeRequest.outcome == "found",
                 )
             )
-            if found_count >= 3:
+            if found_count >= product.code_limit:
                 raise ShopError("code_limit")
             request = MailCodeRequest(
                 user_id=user_id,

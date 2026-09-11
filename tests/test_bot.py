@@ -7,7 +7,7 @@ from aiogram.types import Update
 from sqlalchemy import select
 
 from app.bot import create_dispatcher
-from app.models import Broadcast, Product, User
+from app.models import Broadcast, MailCodeRequest, Order, PaymentReceipt, Product, User
 
 
 def update(user_id=1, text=None, callback=None, group=False):
@@ -57,7 +57,7 @@ async def test_start_language_catalog_and_admin_denial(shop):
     await storage.close()
 
 
-async def test_admin_button_is_visible_only_to_admin(shop):
+async def test_admin_button_is_not_shown_in_home_inline_menu(shop):
     dp = create_dispatcher(shop, MemoryStorage())
     bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
     bot.session = AsyncMock()
@@ -68,7 +68,7 @@ async def test_admin_button_is_visible_only_to_admin(shop):
 
     await dp.feed_update(bot, update(user_id=99, callback="home"))
     admin_markup = bot.session.call_args.args[1].reply_markup
-    assert any(button.callback_data == "a:home" for row in admin_markup.inline_keyboard for button in row)
+    assert all(button.callback_data != "a:home" for row in admin_markup.inline_keyboard for button in row)
 
 
 async def test_group_chats_do_not_receive_credentials(shop):
@@ -86,13 +86,59 @@ async def test_additional_admin_can_open_panel(shop):
     bot.session = AsyncMock()
     await dp.feed_update(bot, update(user_id=1042869230, callback="home"))
     markup = bot.session.call_args.args[1].reply_markup
-    assert any(b.callback_data == "a:home" for row in markup.inline_keyboard for b in row)
+    assert all(b.callback_data != "a:home" for row in markup.inline_keyboard for b in row)
     await dp.feed_update(bot, update(user_id=1042869230, text="/admin"))
     assert "Керування" in bot.session.call_args.args[1].text
     await dp.feed_update(bot, update(user_id=99, text="/admin"))
     assert "Керування" in bot.session.call_args.args[1].text
 
 
+async def test_admin_can_block_and_unblock_user(shop):
+    dp = create_dispatcher(shop, MemoryStorage())
+    bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    bot.session = AsyncMock()
+
+    await dp.feed_update(bot, update(user_id=99, callback="a:user_block:1"))
+    async with shop.sessions() as session:
+        assert (await session.get(User, 1)).access_blocked
+
+    await dp.feed_update(bot, update(user_id=1, text="Menu"))
+    assert "заблоковано за порушення правил" in bot.session.call_args.args[1].text
+
+    await dp.feed_update(bot, update(user_id=99, callback="a:user_block:1"))
+    async with shop.sessions() as session:
+        assert not (await session.get(User, 1)).access_blocked
+
+
+async def test_admin_user_delete_removes_related_data(shop):
+    async with shop.sessions() as session, session.begin():
+        session.add(
+            PaymentReceipt(
+                order_id="a" * 32,
+                user_id=1,
+                telegram_file_id="receipt-file",
+                file_sha256="b" * 64,
+            )
+        )
+        session.add(
+            MailCodeRequest(
+                user_id=1,
+                product_id=1,
+                order_id="a" * 32,
+                outcome="found",
+            )
+        )
+
+    dp = create_dispatcher(shop, MemoryStorage())
+    bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi")
+    bot.session = AsyncMock()
+    await dp.feed_update(bot, update(user_id=99, callback="a:user_delete_confirm:1"))
+
+    async with shop.sessions() as session:
+        assert await session.get(User, 1) is None
+        assert await session.get(Order, "a" * 32) is None
+        assert await session.scalar(select(PaymentReceipt).where(PaymentReceipt.user_id == 1)) is None
+        assert await session.scalar(select(MailCodeRequest).where(MailCodeRequest.user_id == 1)) is None
 async def test_admin_product_wizard_edit_and_confirmed_delete(shop):
     storage = MemoryStorage()
     dp = create_dispatcher(shop, storage)
